@@ -395,12 +395,14 @@ def run_one_job(
             with db_session(database) as db:
                 state = db.execute("SELECT status FROM jobs WHERE job_id=?", (lease["job_id"],)).fetchone()
             actual_status = state["status"] if state else "failed"
+            previous_manifest = json.loads((job_dir / "manifest.json").read_text(encoding="utf-8"))
+            was_started = bool(previous_manifest.get("processing", {}).get("reconstruction_started", False))
             write_manifest(job_dir, {
                 "status": actual_status,
                 "stage": "cancelled" if actual_status == "cancelled" else "worker_failed",
                 "processing": {
                     "engine": "COLMAP",
-                    "reconstruction_started": True,
+                    "reconstruction_started": was_started,
                     "worker_id": worker_id,
                     "attempt": lease["attempt"],
                     "error": f"{type(exc).__name__}: {exc}",
