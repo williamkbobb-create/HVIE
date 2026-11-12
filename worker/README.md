@@ -12,7 +12,7 @@ The worker is local-first and must not be exposed to the public internet. It rea
 - Optional dense pipeline: image undistortion, PatchMatch stereo, stereo fusion and Poisson meshing. Dense completion is withheld unless a PLY mesh header is readable.
 
 ## Local container environment
-The Docker image uses Ubuntu 24.04 and pins the repository package COLMAP 3.9.1-2build2. This distribution package is CPU-only; GPU support is intentionally disabled. Dense reconstruction is also disabled by default.
+The Docker image uses Ubuntu 24.04 and pins the repository package COLMAP 3.9.1-2build2. This distribution package is CPU-only; GPU support is intentionally disabled. CPU COLMAP supports feature extraction, matching and sparse mapping. COLMAP's own dense PatchMatch stereo stage requires a CUDA-enabled COLMAP build and compatible NVIDIA GPU, so the dense pipeline is disabled by default and must not be represented as CPU-capable. The current container is a sparse-reconstruction test image, not a complete dense-to-mesh image.
 
 Compose starts two local services sharing one private Docker volume: the authenticated intake API and the COLMAP worker. The API port is published only on 127.0.0.1. Create a local .env from .env.example and replace the placeholder token with a long random secret before starting the stack. Never commit the real .env file.
 
@@ -24,7 +24,7 @@ The container stack is a local development foundation, not a hosted deployment. 
 - COLMAP_BIN: executable path or command name (default colmap).
 - HVIE_WORKER_ID: optional stable worker identifier.
 - HVIE_COLMAP_USE_GPU: default 0; enable only on a separately validated CUDA build and compatible GPU.
-- HVIE_ENABLE_DENSE: default 0; enable only after sparse reconstruction is validated and the host has sufficient resources.
+- HVIE_ENABLE_DENSE: default 0; enabling this with the current CPU-only COLMAP package is unsupported and will fail at PatchMatch stereo. Do not enable until a CUDA-enabled COLMAP build and compatible GPU are validated.
 - HVIE_WORKER_POLL_SECONDS: queue idle polling interval (default 10 seconds).
 
 ## Job results
@@ -32,6 +32,6 @@ The container stack is a local development foundation, not a hosted deployment. 
 - dense_complete: dense commands ran and a PLY mesh header was validated. Visual quality and suitability for editing still require review.
 - queued or failed: processing failed; inspect last_error and logs/colmap.log.
 
-A sparse model is not a dense surface mesh and is not an editable vehicle. Dense reconstruction can struggle with glossy paint, glass, low-texture panels and incomplete camera coverage. No part segmentation, component pivots, materials, GLB export or browser editor integration is implemented yet.
+A sparse model is not a dense surface mesh and is not an editable vehicle. COLMAP dense reconstruction requires CUDA; a future GPU build must be tested on hardware before enabling it. Dense reconstruction can struggle with glossy paint, glass, low-texture panels and incomplete camera coverage. No part segmentation, component pivots, materials, GLB export or browser editor integration is implemented yet.
 
 No paid reconstruction API or hosted reconstruction service is used.
