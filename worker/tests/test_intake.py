@@ -1,13 +1,11 @@
 import io
-import uuid
-
 from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.main import create_app
 
 
-def image_bytes(color: str = "red") -> bytes:
+def image_bytes(color: tuple[int, int, int] = (255, 0, 0)) -> bytes:
     buffer = io.BytesIO()
     Image.new("RGB", (1200, 800), color=color).save(buffer, format="JPEG")
     return buffer.getvalue()
@@ -33,7 +31,7 @@ def test_job_requires_bearer_token(tmp_path):
 
 def test_accepts_images_and_writes_private_manifest(tmp_path):
     client = make_client(tmp_path)
-    files = [("photos", (f"car-{i}.jpg", image_bytes("red" if i % 2 else "blue"), "image/jpeg")) for i in range(12)]
+    files = [("photos", (f"car-{i}.jpg", image_bytes((i * 17, i * 11, i * 7)), "image/jpeg")) for i in range(12)]
     response = client.post(
         "/v1/jobs",
         headers={"Authorization": "Bearer test-secret"},
