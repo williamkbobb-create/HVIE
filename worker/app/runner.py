@@ -207,6 +207,8 @@ def run_command(
     lease: dict,
     timeout_seconds: int,
 ) -> None:
+    if not owns_lease(database, lease):
+        raise RuntimeError("Worker lease is no longer active before command start")
     started = time.monotonic()
     next_heartbeat = started + HEARTBEAT_SECONDS
     with log_path.open("a", encoding="utf-8") as log:
@@ -255,7 +257,18 @@ def run_command(
 
 def finish_job(database: Path, job_dir: Path, lease: dict, status: str, artifacts: dict) -> None:
     now = stamp(now_utc())
-    manifest_update = {
+    with db_session(database) as db:
+        db.execute("BEGIN IMMEDIATE")
+        result = db.execute(
+            "UPDATE jobs SET status=?,worker_id=NULL,lease_hash=NULL,lease_expires_at=NULL,updated_at=?,last_error=NULL "
+            "WHERE job_id=? AND status='running' AND worker_id=? AND lease_hash=? AND lease_expires_at>?",
+            (status, now, lease["job_id"], lease["worker_id"], digest_token(lease["lease_token"]), now),
+        )
+        if result.rowcount != 1:
+            db.execute("ROLLBACK")
+            raise RuntimeError("Could not commit reconstruction result: worker no longer owns the job lease")
+        db.execute("COMMIT")
+    write_manifest(job_dir, {
         "status": status,
         "stage": status,
         "processing": {
@@ -267,16 +280,7 @@ def finish_job(database: Path, job_dir: Path, lease: dict, status: str, artifact
             "artifacts": artifacts,
             "note": "Sparse structure-from-motion completed. This is not yet a segmented, editable vehicle model.",
         },
-    }
-    write_manifest(job_dir, manifest_update)
-    with db_session(database) as db:
-        result = db.execute(
-            "UPDATE jobs SET status=?,worker_id=NULL,lease_hash=NULL,lease_expires_at=NULL,updated_at=?,last_error=NULL "
-            "WHERE job_id=? AND status='running' AND worker_id=? AND lease_hash=?",
-            (status, now, lease["job_id"], lease["worker_id"], digest_token(lease["lease_token"])),
-        )
-    if result.rowcount != 1:
-        raise RuntimeError("Could not commit reconstruction result: worker no longer owns the job lease")
+    })
 
 
 def fail_job(database: Path, lease: dict, error: str) -> None:
