@@ -11,7 +11,7 @@ Standalone photo-to-3D vehicle capture and customization workspace.
 6. Customize body paint, wheels, seats, interior trim, glass and supported components.
 
 ## Current milestone
-This branch establishes the standalone web application and browser-only capture intake. It does not yet upload photos, run COLMAP, produce a GLB, segment vehicle parts, or provide a reconstructed vehicle viewer. The intake threshold is a basic guard, not a guarantee of successful photogrammetry.
+The browser app provides guided capture intake and coverage review. The private worker foundation supports authenticated, local-only intake, strict image validation, duplicate detection and private job manifests. The frontend is not connected to the worker. The worker does not yet execute COLMAP or produce a 3D asset.
 
 ## Engineering direction
 - React, TypeScript and Vite web application.
