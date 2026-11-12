@@ -89,3 +89,31 @@ def test_runner_returns_idle_without_queued_jobs(tmp_path):
             )
         """)
     assert run_one_job(tmp_path, worker_id="test-worker") == "idle"
+
+
+def test_missing_colmap_does_not_claim_reconstruction_started(tmp_path):
+    job_id = setup_job(tmp_path)
+    run_one_job(tmp_path, "/not/a/real/colmap", worker_id="test-worker")
+    manifest = json.loads((tmp_path / job_id / "manifest.json").read_text())
+    assert manifest["processing"]["reconstruction_started"] is False
+    assert manifest["status"] == "queued"
+
+
+def test_dense_pipeline_requires_a_readable_mesh(tmp_path):
+    job_id = setup_job(tmp_path)
+    binary = fake_colmap(tmp_path)
+    script = binary.read_text()
+    script += """ 
+if command == "poisson_mesher":
+    output = pathlib.Path(sys.argv[sys.argv.index("--output_path") + 1])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(b"ply\\nformat ascii 1.0\\nelement vertex 3\\nproperty float x\\nproperty float y\\nproperty float z\\nend_header\\n0 0 0\\n")
+"""
+    binary.write_text(script)
+    binary.chmod(0o755)
+    result = run_one_job(tmp_path, str(binary), worker_id="test-worker", dense=True)
+    assert result == "dense_complete"
+    manifest = json.loads((tmp_path / job_id / "manifest.json").read_text())
+    mesh = tmp_path / job_id / manifest["processing"]["artifacts"]["dense_mesh"]
+    assert mesh.is_file()
+    assert mesh.read_bytes().startswith(b"ply")
