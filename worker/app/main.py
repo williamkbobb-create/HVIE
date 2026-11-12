@@ -18,6 +18,7 @@ from PIL import Image, UnidentifiedImageError
 MAX_FILES = 50
 MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_TOTAL_BYTES = 500 * 1024 * 1024
+MAX_PIXELS = 60_000_000
 ALLOWED_FORMATS = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}
 CHUNK_SIZE = 1024 * 1024
 
@@ -114,6 +115,8 @@ def create_app(api_token: str | None = None, storage_root: Path | None = None) -
 
                 if image_format not in ALLOWED_FORMATS:
                     raise HTTPException(status_code=415, detail=f"Photo {index} must be JPEG, PNG or WebP")
+                if width * height > MAX_PIXELS:
+                    raise HTTPException(status_code=413, detail=f"Photo {index} exceeds the 60-megapixel safety limit")
                 if width < 1000 or height < 650:
                     raise HTTPException(status_code=422, detail=f"Photo {index} must be at least 1000 × 650 pixels")
 
