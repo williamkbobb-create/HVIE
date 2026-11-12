@@ -117,3 +117,66 @@ def test_empty_queue_returns_idle(tmp_path):
         json={"worker_id": "worker-test"},
     )
     assert response.json()["status"] == "idle"
+
+
+def test_expired_lease_is_reclaimed_and_old_worker_is_rejected(tmp_path):
+    import sqlite3
+
+    client = make_client(tmp_path)
+    job_id = submit_job(client)
+    headers = {"Authorization": "Bearer test-secret"}
+    first = client.post(
+        "/v1/worker/claim", headers=headers, json={"worker_id": "worker-one"}
+    ).json()
+    with sqlite3.connect(tmp_path / "queue.sqlite3") as db:
+        db.execute(
+            "UPDATE jobs SET lease_expires_at=? WHERE job_id=?",
+            ("2000-01-01T00:00:00+00:00", job_id),
+        )
+        db.commit()
+
+    second_response = client.post(
+        "/v1/worker/claim", headers=headers, json={"worker_id": "worker-two"}
+    )
+    assert second_response.status_code == 200
+    second = second_response.json()
+    assert second["status"] == "claimed"
+    assert second["job_id"] == job_id
+    assert second["attempt"] == 2
+
+    stale = client.post(
+        f"/v1/worker/heartbeat?job_id={job_id}",
+        headers=headers,
+        json={"worker_id": "worker-one", "lease_token": first["lease_token"]},
+    )
+    assert stale.status_code == 409
+
+
+def test_job_fails_after_maximum_attempts(tmp_path):
+    client = make_client(tmp_path)
+    job_id = submit_job(client)
+    headers = {"Authorization": "Bearer test-secret"}
+    for attempt in range(3):
+        claim = client.post(
+            "/v1/worker/claim",
+            headers=headers,
+            json={"worker_id": f"worker-{attempt}"},
+        ).json()
+        assert claim["status"] == "claimed"
+        failed = client.post(
+            f"/v1/worker/fail?job_id={job_id}",
+            headers=headers,
+            json={
+                "worker_id": f"worker-{attempt}",
+                "lease_token": claim["lease_token"],
+                "error": f"failure {attempt + 1}",
+            },
+        )
+        assert failed.status_code == 200
+    state = client.get(f"/v1/jobs/{job_id}", headers=headers).json()
+    assert state["status"] == "failed"
+    assert state["queue"]["attempt_count"] == 3
+    idle = client.post(
+        "/v1/worker/claim", headers=headers, json={"worker_id": "worker-final"}
+    ).json()
+    assert idle["status"] == "idle"
