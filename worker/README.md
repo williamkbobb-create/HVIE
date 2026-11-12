@@ -1,40 +1,34 @@
-# HVIE private reconstruction worker — queue-control milestone
+# HVIE local reconstruction worker
 
-This API is a private, local-first control plane. It is not deployed and must not be exposed to the public internet.
+The worker is local-first and must not be exposed to the public internet. It reads the same private storage directory and SQLite queue used by the private intake API.
 
-## Implemented
-- Bearer-token protected job intake, inspection, worker claims, heartbeats, failure reporting and operator cancellation.
-- JPEG, PNG and WebP content validation; image contents are decoded rather than trusting MIME types.
-- Minimum 12 photos, maximum 50 photos, 25 MiB per photo, 500 MiB per job and a 60-megapixel per-image safety ceiling.
-- Minimum decoded image dimensions of 1000 × 650 and SHA-256 duplicate detection.
-- Server-generated filenames and UUID job directories.
-- SQLite-backed transactional queue with atomic claims, expiring leases, worker identity binding and bounded retries (3 attempts).
-- Lease tokens are stored as SHA-256 hashes, not plaintext.
-- Database and uploaded files remain under private local storage.
+## Implemented queue and runner
+- Transactional SQLite claims with expiring worker leases and SHA-256 hashed lease tokens.
+- Lease heartbeats during long-running COLMAP commands and ownership checks before commands and final completion.
+- Cancellation detection: the runner checks queue state and terminates its active COLMAP process if an operator cancels the job.
+- Bounded retries (3 attempts), failure logging and job manifests.
+- Safe subprocess execution with argument arrays (no shell), per-job logs and a six-hour default command timeout.
+- Sparse SfM pipeline: feature extraction, exhaustive matching and incremental mapper.
+- Optional dense pipeline: image undistortion, PatchMatch stereo, stereo fusion and Poisson meshing. Dense completion is withheld unless a PLY mesh header is readable.
 
-## API routes
-All routes except GET /health require Authorization: Bearer <HVIE_WORKER_TOKEN>.
-- POST /v1/jobs — multipart form fields: project_name, vehicle_category and at least 12 photos.
-- GET /v1/jobs/{job_id} — inspect job and queue state.
-- POST /v1/worker/claim — JSON worker_id and optional lease_seconds (30–900).
-- POST /v1/worker/heartbeat?job_id=... — JSON worker_id, lease_token and optional lease_seconds.
-- POST /v1/worker/fail?job_id=... — JSON worker_id, lease_token and error; retries until attempt limit.
-- POST /v1/jobs/{job_id}/cancel — JSON optional reason; cancels queued or running work and invalidates its lease.
+## Start locally
+Use Python 3.11+ and install requirements.txt. Configure:
+- HVIE_WORKER_TOKEN: long random secret for the private intake API.
+- HVIE_PRIVATE_STORAGE: same private directory for API and worker, outside the repository.
+- COLMAP_BIN: executable path or command name (default colmap).
+- HVIE_WORKER_ID: optional stable worker identifier.
+- HVIE_COLMAP_USE_GPU: default 0; set to 1 only when CUDA/GPU support is confirmed.
+- HVIE_ENABLE_DENSE: default 0; set to 1 only after sparse reconstruction has been validated and the host has sufficient resources.
+- HVIE_WORKER_POLL_SECONDS: queue idle polling interval (default 10 seconds).
 
-Expired leases are re-queued while attempts remain; otherwise the job becomes failed. A worker with an expired or replaced lease cannot renew or report failure using its old token.
+Run the private API on loopback: uvicorn app.main:app --host 127.0.0.1 --port 8787.
+Run the worker in another process: python -m app.runner.
 
-## Explicit limitations
-- These endpoints are queue-control primitives only; no background worker process is connected yet.
-- No COLMAP command is executed and no reconstruction output is produced.
-- There is intentionally no completion endpoint. A job must not be marked complete until real reconstruction produces validated artifacts.
-- No customer accounts, multi-tenant authorization, retention policy, malware scanning or encrypted remote storage.
-- Do not store real customer photographs on a shared/public host until those controls exist.
+## Job results
+- sparse_complete: COLMAP produced a sparse model containing cameras.bin, images.bin and points3D.bin.
+- dense_complete: the dense commands ran and a PLY mesh header was validated. Visual quality and suitability for editing still require review.
+- queued or failed: processing failed; see last_error and logs/colmap.log.
 
-## Local development
-Use Python 3.11 or newer.
-1. Install dependencies from requirements.txt.
-2. Set HVIE_WORKER_TOKEN to a long random secret and HVIE_PRIVATE_STORAGE to a private directory outside the repository.
-3. Run locally on loopback only: uvicorn app.main:app --host 127.0.0.1 --port 8787.
-4. Run tests from this directory with pytest -q.
+A sparse model is not a dense surface mesh and is not an editable vehicle. Dense reconstruction can struggle with glossy paint, glass, low-texture panels and incomplete camera coverage. No part segmentation, component pivots, materials, GLB export or browser editor integration is implemented yet.
 
-Never bind this API to 0.0.0.0 or deploy it publicly at this stage. The browser preview remains a static frontend and does not send photos to this API.
+Never bind the API to 0.0.0.0 or deploy it publicly at this stage. No paid API or hosted reconstruction service is used.
