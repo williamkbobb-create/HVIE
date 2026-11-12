@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
@@ -38,11 +39,20 @@ def connect(database: Path) -> sqlite3.Connection:
     return db
 
 
+@contextmanager
+def db_session(database: Path):
+    db = connect(database)
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 def claim_job(database: Path, worker_id: str, lease_seconds: int = LEASE_SECONDS) -> dict | None:
     now = now_utc()
     expires = now + timedelta(seconds=lease_seconds)
     lease = secrets.token_urlsafe(36)
-    with connect(database) as db:
+    with db_session(database) as db:
         db.execute("BEGIN IMMEDIATE")
         expired = db.execute(
             "SELECT job_id,attempt_count,max_attempts FROM jobs "
@@ -84,7 +94,7 @@ def claim_job(database: Path, worker_id: str, lease_seconds: int = LEASE_SECONDS
 
 
 def owns_lease(database: Path, lease: dict) -> bool:
-    with connect(database) as db:
+    with db_session(database) as db:
         row = db.execute("SELECT * FROM jobs WHERE job_id=?", (lease["job_id"],)).fetchone()
     return bool(
         row
@@ -99,7 +109,7 @@ def owns_lease(database: Path, lease: dict) -> bool:
 def heartbeat(database: Path, lease: dict, lease_seconds: int = LEASE_SECONDS) -> bool:
     now = now_utc()
     expires = now + timedelta(seconds=lease_seconds)
-    with connect(database) as db:
+    with db_session(database) as db:
         result = db.execute(
             "UPDATE jobs SET lease_expires_at=?,updated_at=? WHERE job_id=? AND status='running' "
             "AND worker_id=? AND lease_hash=? AND lease_expires_at>?",
@@ -131,12 +141,11 @@ def find_sparse_model(sparse_root: Path) -> Path | None:
     return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
 
-def command_plan(colmap_bin: str, job_dir: Path, use_gpu: bool, dense: bool) -> list[tuple[str, list[str]]]:
+def sparse_command_plan(colmap_bin: str, job_dir: Path, use_gpu: bool) -> list[tuple[str, list[str]]]:
     images = job_dir / "photos"
     database = job_dir / "database.db"
     sparse = job_dir / "sparse"
-    dense_dir = job_dir / "dense"
-    plan = [
+    return [
         ("feature_extraction", [
             colmap_bin, "feature_extractor", "--database_path", str(database),
             "--image_path", str(images), "--FeatureExtraction.use_gpu", "1" if use_gpu else "0",
@@ -150,29 +159,45 @@ def command_plan(colmap_bin: str, job_dir: Path, use_gpu: bool, dense: bool) -> 
             "--image_path", str(images), "--output_path", str(sparse),
         ]),
     ]
-    if dense:
-        model = sparse / "0"
-        plan.extend([
-            ("image_undistortion", [
-                colmap_bin, "image_undistorter", "--image_path", str(images),
-                "--input_path", str(model), "--output_path", str(dense_dir),
-                "--output_type", "COLMAP", "--max_image_size", "2000",
-            ]),
-            ("patch_match_stereo", [
-                colmap_bin, "patch_match_stereo", "--workspace_path", str(dense_dir),
-                "--workspace_format", "COLMAP", "--PatchMatchStereo.geom_consistency", "true",
-            ]),
-            ("stereo_fusion", [
-                colmap_bin, "stereo_fusion", "--workspace_path", str(dense_dir),
-                "--workspace_format", "COLMAP", "--input_type", "geometric",
-                "--output_path", str(dense_dir / "fused.ply"),
-            ]),
-            ("poisson_meshing", [
-                colmap_bin, "poisson_mesher", "--input_path", str(dense_dir / "fused.ply"),
-                "--output_path", str(dense_dir / "meshed-poisson.ply"),
-            ]),
-        ])
-    return plan
+
+
+def dense_command_plan(colmap_bin: str, job_dir: Path, model: Path) -> list[tuple[str, list[str]]]:
+    images = job_dir / "photos"
+    dense_dir = job_dir / "dense"
+    return [
+        ("image_undistortion", [
+            colmap_bin, "image_undistorter", "--image_path", str(images),
+            "--input_path", str(model), "--output_path", str(dense_dir),
+            "--output_type", "COLMAP", "--max_image_size", "2000",
+        ]),
+        ("patch_match_stereo", [
+            colmap_bin, "patch_match_stereo", "--workspace_path", str(dense_dir),
+            "--workspace_format", "COLMAP", "--PatchMatchStereo.geom_consistency", "true",
+        ]),
+        ("stereo_fusion", [
+            colmap_bin, "stereo_fusion", "--workspace_path", str(dense_dir),
+            "--workspace_format", "COLMAP", "--input_type", "geometric",
+            "--output_path", str(dense_dir / "fused.ply"),
+        ]),
+        ("poisson_meshing", [
+            colmap_bin, "poisson_mesher", "--input_path", str(dense_dir / "fused.ply"),
+            "--output_path", str(dense_dir / "meshed-poisson.ply"),
+        ]),
+    ]
+
+
+def valid_ply_mesh(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size < 32:
+        return False
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(65536).split(b"end_header", 1)
+        if len(header) != 2:
+            return False
+        text = header[0].decode("ascii", errors="strict")
+        return text.startswith("ply") and "format " in text and "element vertex " in text
+    except (OSError, UnicodeDecodeError):
+        return False
 
 
 def run_command(
@@ -213,7 +238,7 @@ def run_command(
                         process.wait()
                     raise RuntimeError("Worker lease was lost; command terminated")
                 next_heartbeat = time.monotonic() + HEARTBEAT_SECONDS
-            with connect(database) as db:
+            with db_session(database) as db:
                 row = db.execute("SELECT status FROM jobs WHERE job_id=?", (lease["job_id"],)).fetchone()
             if row is None or row["status"] == "cancelled":
                 os.killpg(process.pid, signal.SIGTERM)
@@ -244,7 +269,7 @@ def finish_job(database: Path, job_dir: Path, lease: dict, status: str, artifact
         },
     }
     write_manifest(job_dir, manifest_update)
-    with connect(database) as db:
+    with db_session(database) as db:
         result = db.execute(
             "UPDATE jobs SET status=?,worker_id=NULL,lease_hash=NULL,lease_expires_at=NULL,updated_at=?,last_error=NULL "
             "WHERE job_id=? AND status='running' AND worker_id=? AND lease_hash=?",
@@ -256,7 +281,7 @@ def finish_job(database: Path, job_dir: Path, lease: dict, status: str, artifact
 
 def fail_job(database: Path, lease: dict, error: str) -> None:
     now = stamp(now_utc())
-    with connect(database) as db:
+    with db_session(database) as db:
         row = db.execute("SELECT attempt_count,max_attempts,status FROM jobs WHERE job_id=?", (lease["job_id"],)).fetchone()
         if not row or row["status"] != "running":
             return
@@ -310,7 +335,7 @@ def run_one_job(
                 "note": "Local COLMAP process started; no editable vehicle parts are generated at this stage.",
             },
         })
-        for stage, command in command_plan(colmap_bin, job_dir, use_gpu, dense):
+        for stage, command in sparse_command_plan(colmap_bin, job_dir, use_gpu):
             write_manifest(job_dir, {
                 "status": "running",
                 "stage": stage,
@@ -332,21 +357,46 @@ def run_one_job(
             "sparse_model": str(model.relative_to(job_dir)),
             "sparse_model_files": ["cameras.bin", "images.bin", "points3D.bin"],
             "log": "logs/colmap.log",
-            "dense_mesh": "dense/meshed-poisson.ply" if dense else None,
+            "dense_mesh": None,
         }
-        finish_job(database, job_dir, lease, "dense_complete" if dense else "sparse_complete", artifacts)
-        return "dense_complete" if dense else "sparse_complete"
+        result_status = "sparse_complete"
+        if dense:
+            for stage, command in dense_command_plan(colmap_bin, job_dir, model):
+                write_manifest(job_dir, {
+                    "status": "running",
+                    "stage": stage,
+                    "processing": {
+                        "engine": "COLMAP",
+                        "reconstruction_started": True,
+                        "current_stage": stage,
+                        "worker_id": worker_id,
+                        "attempt": lease["attempt"],
+                        "log_file": "logs/colmap.log",
+                    },
+                })
+                run_command(command, log_path, database, lease, timeout_seconds)
+            mesh = job_dir / "dense" / "meshed-poisson.ply"
+            if not valid_ply_mesh(mesh):
+                raise RuntimeError("Dense pipeline ended without a readable PLY mesh")
+            artifacts["dense_mesh"] = str(mesh.relative_to(job_dir))
+            result_status = "dense_complete"
+
+        finish_job(database, job_dir, lease, result_status, artifacts)
+        return result_status
     except Exception as exc:
         with log_path.open("a", encoding="utf-8") as log:
             log.write(f"\nHVIE worker error: {type(exc).__name__}: {exc}\n")
         fail_job(database, lease, f"{type(exc).__name__}: {exc}")
         try:
+            with db_session(database) as db:
+                state = db.execute("SELECT status FROM jobs WHERE job_id=?", (lease["job_id"],)).fetchone()
+            actual_status = state["status"] if state else "failed"
             write_manifest(job_dir, {
-                "status": "queued" if lease["attempt"] < lease["max_attempts"] else "failed",
-                "stage": "worker_failed",
+                "status": actual_status,
+                "stage": "cancelled" if actual_status == "cancelled" else "worker_failed",
                 "processing": {
                     "engine": "COLMAP",
-                    "reconstruction_started": False,
+                    "reconstruction_started": True,
                     "worker_id": worker_id,
                     "attempt": lease["attempt"],
                     "error": f"{type(exc).__name__}: {exc}",
