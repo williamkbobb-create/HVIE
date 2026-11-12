@@ -1,37 +1,83 @@
 # HVIE local reconstruction worker
 
-The worker is local-first and must not be exposed to the public internet. It reads the same private storage directory and SQLite queue used by the private intake API.
+This folder contains the private Python intake API, SQLite-backed job state, COLMAP runner, Docker image, Compose definition and tests.
 
-## Queue and execution
-- Transactional SQLite claims with expiring worker leases and SHA-256 hashed lease tokens.
-- Lease heartbeats during long-running COLMAP commands and ownership checks before commands and final completion.
-- Cancellation detection terminates the active COLMAP process and preserves the cancelled state.
-- Bounded retries (3 attempts), failure logging and job manifests.
-- Safe subprocess execution with argument arrays (no shell), per-job logs and a six-hour default command timeout.
-- Sparse SfM pipeline: feature extraction, exhaustive matching and incremental mapper.
-- Optional dense pipeline: image undistortion, PatchMatch stereo, stereo fusion and Poisson meshing. Dense completion is withheld unless a PLY mesh header is readable.
+**Security posture:** local development only. Do not expose the API to the public internet or use it for real customer uploads.
 
-## Local container environment
-The Docker image uses Ubuntu 24.04 and pins the repository package COLMAP 3.9.1-2build2. This distribution package is CPU-only; GPU support is intentionally disabled. CPU COLMAP supports feature extraction, matching and sparse mapping. COLMAP's own dense PatchMatch stereo stage requires a CUDA-enabled COLMAP build and compatible NVIDIA GPU, so the dense pipeline is disabled by default and must not be represented as CPU-capable. The current container is a sparse-reconstruction test image, not a complete dense-to-mesh image.
+## Components
+- `app/main.py`: FastAPI intake and job/worker endpoints; Pillow-based image validation; private job directories, manifests and SQLite queue.
+- `app/runner.py`: local worker process; direct SQLite queue claims; lease heartbeats; COLMAP subprocess orchestration; logs and result checks.
+- `tests/test_intake.py`: API, validation, queue, lease, retry and cancellation tests.
+- `tests/test_runner.py`: runner orchestration tests using a fake COLMAP executable.
+- `Dockerfile`: Ubuntu 24.04 image with pinned CPU-only COLMAP package and Python dependencies.
+- `compose.yaml`: loopback-bound API and worker sharing a private Docker volume.
+- `.env.example`: placeholder environment settings; never put a real secret in Git.
+- `requirements.txt`: pinned Python dependencies.
 
-Compose starts two local services sharing one private Docker volume: the authenticated intake API and the COLMAP worker. The API port is published only on 127.0.0.1. Create a local .env from .env.example and replace the placeholder token with a long random secret before starting the stack. Never commit the real .env file.
+## Current implementation
 
-The container stack is a local development foundation, not a hosted deployment. It has no customer identity system, multi-tenant isolation, encrypted remote storage, retention controls or public upload protections. Do not expose the API or use it for real customer uploads yet.
+The API accepts authenticated multipart photo uploads and validates JPEG, PNG and WebP content. Limits currently include 50 files, 25 MiB per file, 500 MiB total and 60 megapixels per image. It rejects duplicate image content using SHA-256, generates server-side filenames, and stores job manifests and files under the private storage root.
+
+The SQLite queue supports transactional claims, expiring leases, heartbeats, bounded retries (3 attempts), failure reporting and cancellation. The runner claims jobs directly from the same SQLite database, verifies lease ownership, writes per-job logs, terminates work after cancellation or lease loss, and checks for a sparse model containing `cameras.bin`, `images.bin` and `points3D.bin`.
+
+**Important integration gap:** the API exposes worker claim/heartbeat/fail endpoints, while `app/runner.py` currently performs its own direct SQLite claims and lease heartbeats. These are two ways of interacting with the queue, not a fully unified remote-worker protocol. Consolidate and test this boundary before scaling or deploying separate services.
+
+## COLMAP processing stages
+
+### Sparse (initial target)
+1. `feature_extractor`
+2. `exhaustive_matcher`
+3. `mapper`
+
+A valid sparse result is a camera/pose/3D-point reconstruction. It is not a dense surface mesh and not an editable car.
+
+### Dense (not enabled / not validated)
+The code contains an optional sequence:
+1. `image_undistorter`
+2. `patch_match_stereo`
+3. `stereo_fusion`
+4. `poisson_mesher`
+
+The Dockerfile installs Ubuntu 24.04's `colmap=3.9.1-2build2` package, which is CPU-only. COLMAP PatchMatch dense stereo requires a CUDA-enabled COLMAP build and compatible NVIDIA GPU. The Compose configuration sets `HVIE_ENABLE_DENSE=0` and `HVIE_COLMAP_USE_GPU=0`. Do not enable dense processing in this image. A future GPU build or CPU-capable alternative must be evaluated, licensed, built and tested before changing this default.
+
+A PLY header check confirms only that a file looks structurally like a PLY file. It does not prove geometric quality, complete surfaces, texture quality, watertightness or suitability for editing.
+
+## Local container setup
+
+1. Copy `.env.example` to `.env` in this folder.
+2. Replace the placeholder `HVIE_WORKER_TOKEN` with a long random secret.
+3. Set `HVIE_PRIVATE_STORAGE` to a private local path where appropriate for the chosen run mode.
+4. Never commit `.env`, uploaded photos, private job data, logs or generated assets.
+5. Keep the API bound to loopback. The Compose port mapping is `127.0.0.1:8787:8787`.
+
+The root documentation [docs/WINDOWS_LOCAL_SETUP.md](../docs/WINDOWS_LOCAL_SETUP.md) describes the current laptop-first setup. Docker is optional for the first Python tests and may be memory-heavy on an 8 GB laptop.
 
 ## Environment settings
-- HVIE_WORKER_TOKEN: long random secret for the private intake API.
-- HVIE_PRIVATE_STORAGE: same private directory for API and worker; Compose sets this to /data.
-- COLMAP_BIN: executable path or command name (default colmap).
-- HVIE_WORKER_ID: optional stable worker identifier.
-- HVIE_COLMAP_USE_GPU: default 0; enable only on a separately validated CUDA build and compatible GPU.
-- HVIE_ENABLE_DENSE: default 0; enabling this with the current CPU-only COLMAP package is unsupported and will fail at PatchMatch stereo. Do not enable until a CUDA-enabled COLMAP build and compatible GPU are validated.
-- HVIE_WORKER_POLL_SECONDS: queue idle polling interval (default 10 seconds).
 
-## Job results
-- sparse_complete: COLMAP produced a sparse model containing cameras.bin, images.bin and points3D.bin.
-- dense_complete: dense commands ran and a PLY mesh header was validated. Visual quality and suitability for editing still require review.
-- queued or failed: processing failed; inspect last_error and logs/colmap.log.
+| Variable | Meaning | Current default / rule |
+|---|---|---|
+| `HVIE_WORKER_TOKEN` | API bearer token | Must be replaced locally; never commit |
+| `HVIE_PRIVATE_STORAGE` | Private job storage directory | Compose uses `/data` |
+| `COLMAP_BIN` | COLMAP executable | `colmap` |
+| `HVIE_WORKER_ID` | Worker identifier | Generated if omitted |
+| `HVIE_COLMAP_USE_GPU` | GPU feature extraction/matching | `0` by default |
+| `HVIE_ENABLE_DENSE` | Dense reconstruction sequence | `0`; unsupported in current CPU image |
+| `HVIE_WORKER_POLL_SECONDS` | Queue idle polling interval | `10` seconds |
 
-A sparse model is not a dense surface mesh and is not an editable vehicle. COLMAP dense reconstruction requires CUDA; a future GPU build must be tested on hardware before enabling it. Dense reconstruction can struggle with glossy paint, glass, low-texture panels and incomplete camera coverage. No part segmentation, component pivots, materials, GLB export or browser editor integration is implemented yet.
+## Test evidence and limitations
 
-No paid reconstruction API or hosted reconstruction service is used.
+The runner tests use a generated fake executable to simulate COLMAP command success/failure and output files. They test orchestration behavior, not the real COLMAP binary, photogrammetry, dense reconstruction or vehicle quality. Run `pytest -q` from this folder after installing `requirements.txt`; record the actual result and environment. The GitHub Actions workflow also builds the CPU image and checks command help/imports, but command-help checks do not validate an actual photo reconstruction.
+
+## Not implemented
+
+- Frontend-to-API upload integration.
+- Unified API/worker protocol for distributed execution.
+- Real vehicle photo-set reconstruction proof.
+- Supported dense pipeline.
+- Vehicle-specific mesh cleanup and part segmentation.
+- Component hierarchy/pivots and materials.
+- GLB/glTF export.
+- Three.js editor and asset delivery.
+- Production identity, multi-tenant isolation, encrypted remote storage, retention/deletion, malware scanning and public upload protections.
+
+Do not market this worker as a production customer-upload service or as a completed photo-to-editable-car engine.
