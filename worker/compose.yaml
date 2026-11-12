@@ -1,0 +1,40 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      HVIE_PRIVATE_STORAGE: /data
+      COLMAP_BIN: colmap
+      HVIE_COLMAP_USE_GPU: "0"
+      HVIE_ENABLE_DENSE: "0"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8787"]
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - hvie-private-data:/data
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      HVIE_PRIVATE_STORAGE: /data
+      COLMAP_BIN: colmap
+      HVIE_COLMAP_USE_GPU: "0"
+      HVIE_ENABLE_DENSE: "0"
+      HVIE_WORKER_POLL_SECONDS: "10"
+    command: ["python", "-m", "app.runner"]
+    volumes:
+      - hvie-private-data:/data
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  hvie-private-data:
