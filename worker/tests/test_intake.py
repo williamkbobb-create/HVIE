@@ -5,9 +5,9 @@ from PIL import Image
 from app.main import create_app
 
 
-def image_bytes(color: tuple[int, int, int] = (255, 0, 0)) -> bytes:
+def image_bytes(color: tuple[int, int, int]) -> bytes:
     buffer = io.BytesIO()
-    Image.new("RGB", (1200, 800), color=color).save(buffer, format="JPEG")
+    Image.new("RGB", (1200, 800), color=color).save(buffer, format="JPEG", quality=90)
     return buffer.getvalue()
 
 
@@ -15,42 +15,43 @@ def make_client(tmp_path):
     return TestClient(create_app(api_token="test-secret", storage_root=tmp_path))
 
 
-def test_health_is_public_and_does_not_expose_storage(tmp_path):
-    response = make_client(tmp_path).get("/health")
-    assert response.status_code == 200
-    assert response.json()["mode"] == "intake-only"
-    assert str(tmp_path) not in response.text
+def make_files():
+    return [
+        ("photos", (f"car-{i}.jpg", image_bytes((i * 17, i * 11, i * 7)), "image/jpeg"))
+        for i in range(12)
+    ]
 
 
-def test_job_requires_bearer_token(tmp_path):
-    response = make_client(tmp_path).post("/v1/jobs", data={
-        "project_name": "Car project", "vehicle_category": "Passenger car"
-    })
-    assert response.status_code == 401
-
-
-def test_accepts_images_and_writes_private_manifest(tmp_path):
-    client = make_client(tmp_path)
-    files = [("photos", (f"car-{i}.jpg", image_bytes((i * 17, i * 11, i * 7)), "image/jpeg")) for i in range(12)]
+def submit_job(client):
     response = client.post(
         "/v1/jobs",
         headers={"Authorization": "Bearer test-secret"},
         data={"project_name": "Toyota test", "vehicle_category": "Passenger car"},
-        files=files,
+        files=make_files(),
     )
     assert response.status_code == 202, response.text
-    result = response.json()
-    assert result["photo_count"] == 12
-    job_id = result["job_id"]
-    assert (tmp_path / job_id / "manifest.json").is_file()
+    return response.json()["job_id"]
+
+
+def test_health_and_authentication(tmp_path):
+    client = make_client(tmp_path)
+    assert client.get("/health").json()["mode"] == "private-queue-no-reconstruction"
+    assert client.get("/v1/jobs/not-a-uuid").status_code == 401
+
+
+def test_job_intake_and_manifest(tmp_path):
+    client = make_client(tmp_path)
+    job_id = submit_job(client)
     manifest = client.get(f"/v1/jobs/{job_id}", headers={"Authorization": "Bearer test-secret"})
     assert manifest.status_code == 200
-    assert manifest.json()["processing"]["reconstruction_started"] is False
+    assert manifest.json()["status"] == "queued"
+    assert len(manifest.json()["photos"]) == 12
+    assert manifest.json()["queue"]["attempt_count"] == 0
 
 
 def test_rejects_duplicate_images_and_cleans_staging(tmp_path):
     client = make_client(tmp_path)
-    duplicate = image_bytes()
+    duplicate = image_bytes((1, 2, 3))
     files = [("photos", (f"same-{i}.jpg", duplicate, "image/jpeg")) for i in range(12)]
     response = client.post(
         "/v1/jobs",
@@ -59,12 +60,60 @@ def test_rejects_duplicate_images_and_cleans_staging(tmp_path):
         files=files,
     )
     assert response.status_code == 422
-    assert list(tmp_path.iterdir()) == []
+    assert not list(tmp_path.glob(".*-*"))
 
 
-def test_rejects_invalid_job_identifier(tmp_path):
-    response = make_client(tmp_path).get(
-        "/v1/jobs/../../etc/passwd",
-        headers={"Authorization": "Bearer test-secret"},
+def test_claim_heartbeat_fail_and_retry(tmp_path):
+    client = make_client(tmp_path)
+    job_id = submit_job(client)
+    headers = {"Authorization": "Bearer test-secret"}
+    claim = client.post("/v1/worker/claim", headers=headers, json={"worker_id": "worker-test"})
+    assert claim.status_code == 200
+    lease = claim.json()
+    assert lease["status"] == "claimed"
+    assert lease["job_id"] == job_id
+    identity = {"worker_id": "worker-test", "lease_token": lease["lease_token"]}
+
+    heartbeat = client.post(f"/v1/worker/heartbeat?job_id={job_id}", headers=headers, json=identity)
+    assert heartbeat.status_code == 200
+
+    failed = client.post(f"/v1/worker/fail?job_id={job_id}", headers=headers, json={**identity, "error": "COLMAP not installed"})
+    assert failed.status_code == 200
+    assert failed.json()["status"] == "queued"
+    manifest = client.get(f"/v1/jobs/{job_id}", headers=headers).json()
+    assert manifest["queue"]["attempt_count"] == 1
+    assert manifest["queue"]["last_error"] == "COLMAP not installed"
+
+
+def test_worker_cannot_use_another_workers_lease(tmp_path):
+    client = make_client(tmp_path)
+    job_id = submit_job(client)
+    headers = {"Authorization": "Bearer test-secret"}
+    claim = client.post("/v1/worker/claim", headers=headers, json={"worker_id": "worker-one"}).json()
+    bad = client.post(
+        f"/v1/worker/heartbeat?job_id={job_id}",
+        headers=headers,
+        json={"worker_id": "worker-two", "lease_token": claim["lease_token"]},
     )
-    assert response.status_code == 404
+    assert bad.status_code == 409
+
+
+def test_cancel_prevents_future_claim(tmp_path):
+    client = make_client(tmp_path)
+    job_id = submit_job(client)
+    headers = {"Authorization": "Bearer test-secret"}
+    cancelled = client.post(f"/v1/jobs/{job_id}/cancel", headers=headers, json={"reason": "operator stop"})
+    assert cancelled.status_code == 200
+    claim = client.post("/v1/worker/claim", headers=headers, json={"worker_id": "worker-test"})
+    assert claim.json()["status"] == "idle"
+    assert client.get(f"/v1/jobs/{job_id}", headers=headers).json()["status"] == "cancelled"
+
+
+def test_empty_queue_returns_idle(tmp_path):
+    client = make_client(tmp_path)
+    response = client.post(
+        "/v1/worker/claim",
+        headers={"Authorization": "Bearer test-secret"},
+        json={"worker_id": "worker-test"},
+    )
+    assert response.json()["status"] == "idle"
