@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import tempfile
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
@@ -83,7 +84,15 @@ def create_app(api_token: str | None = None, storage_root: Path | None = None) -
         connection.execute("PRAGMA busy_timeout = 15000")
         return connection
 
-    with connect() as db:
+    @contextmanager
+    def db_session():
+        connection = connect()
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    with db_session() as db:
         db.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 job_id TEXT PRIMARY KEY,
@@ -132,7 +141,7 @@ def create_app(api_token: str | None = None, storage_root: Path | None = None) -
         if not manifest_path.is_file():
             raise HTTPException(status_code=404, detail="Job not found")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        with connect() as db:
+        with db_session() as db:
             row = db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Job not found")
@@ -251,7 +260,7 @@ def create_app(api_token: str | None = None, storage_root: Path | None = None) -
             final_dir = root / job_id
             staging.replace(final_dir)
             try:
-                with connect() as db:
+                with db_session() as db:
                     db.execute(
                         "INSERT INTO jobs(job_id,status,created_at,updated_at,max_attempts) VALUES(?,?,?,?,?)",
                         (job_id, "queued", timestamp, timestamp, MAX_ATTEMPTS),
@@ -282,7 +291,7 @@ def create_app(api_token: str | None = None, storage_root: Path | None = None) -
         now = utc_now()
         expires = now + timedelta(seconds=request.lease_seconds)
         lease = secrets.token_urlsafe(36)
-        with connect() as db:
+        with db_session() as db:
             db.execute("BEGIN IMMEDIATE")
             expired = db.execute(
                 "SELECT job_id, attempt_count, max_attempts FROM jobs WHERE status='running' AND lease_expires_at <= ?",
@@ -325,15 +334,11 @@ def create_app(api_token: str | None = None, storage_root: Path | None = None) -
             "note": "Lease acquired. Reconstruction execution is not connected in this milestone.",
         }
 
-    def validate_lease(db: sqlite3.Connection, identity: WorkerIdentity) -> sqlite3.Row:
-        row = db.execute("SELECT * FROM jobs WHERE job_id=?", (identity_job_id,)).fetchone()
-        return row
-
     @app.post("/v1/worker/heartbeat", dependencies=[Depends(require_token)])
     async def heartbeat(job_id: str, request: LeaseRequest) -> dict:
         now = utc_now()
         expires = now + timedelta(seconds=request.lease_seconds)
-        with connect() as db:
+        with db_session() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
             if row is None:
@@ -359,7 +364,7 @@ def create_app(api_token: str | None = None, storage_root: Path | None = None) -
     @app.post("/v1/worker/fail", dependencies=[Depends(require_token)])
     async def fail_job(job_id: str, request: FailRequest) -> dict:
         now = utc_now()
-        with connect() as db:
+        with db_session() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
             if row is None:
@@ -387,7 +392,7 @@ def create_app(api_token: str | None = None, storage_root: Path | None = None) -
     @app.post("/v1/jobs/{job_id}/cancel", dependencies=[Depends(require_token)])
     async def cancel_job(job_id: str, request: CancelRequest) -> dict:
         now = iso(utc_now())
-        with connect() as db:
+        with db_session() as db:
             result = db.execute(
                 """UPDATE jobs SET status='cancelled', worker_id=NULL, lease_hash=NULL,
                    lease_expires_at=NULL, cancel_reason=?, updated_at=?
